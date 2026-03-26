@@ -1,5 +1,9 @@
 .next/
 node_modules/
-.env.local
-.env
 *.log
+
+.vercel
+.env*.local
+config.bat
+temp_auto_push.bat
+temp_interactive_push.bat

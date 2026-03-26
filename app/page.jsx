@@ -4,18 +4,218 @@ import { useState, useRef } from 'react'
 import {
   Shield, Zap, Lock, Server, Users, Code2, ChevronDown,
   Check, X, ArrowRight, Cpu, Globe, Database, FileText,
-  Mic, Volume2, Key, AlertCircle, Brain, Terminal
+  Mic, Volume2, Key, AlertCircle, Brain, Terminal, Sparkles
 } from 'lucide-react'
 
-// ─── Waitlist Form (reusable) ─────────────────────────────────────────────────
-function WaitlistForm({ size = 'lg', source = 'hero' }) {
-  const [email, setEmail] = useState('')
-  const [status, setStatus] = useState('idle') // idle | loading | success | error
-  const [message, setMessage] = useState('')
+// ─── Recommendation engine ────────────────────────────────────────────────────
+
+// All models — VRAM is Q4_K_M quantized (roughly half of FP16)
+// e.g. Llama 70B FP16 = ~140 GB → Q4_K_M = ~40 GB, fits on A40
+const ALL_MODELS = {
+  // LLMs
+  llama_3b:    { name: 'Llama 3.2 3B',          quant: 'Q4_K_M', type: 'llm', vram: 2,  tier: 'Starter',      costPerReq: 0.00018, ctx: '128k', provider: 'Meta' },
+  llama_8b:    { name: 'Llama 3.1 8B Instruct',  quant: 'Q4_K_M', type: 'llm', vram: 5,  tier: 'Standard',     costPerReq: 0.00042, ctx: '128k', provider: 'Meta' },
+  mistral_7b:  { name: 'Mistral 7B v0.3',        quant: 'Q4_K_M', type: 'llm', vram: 4,  tier: 'Standard',     costPerReq: 0.00038, ctx: '32k',  provider: 'Mistral AI' },
+  qwen_14b:    { name: 'Qwen 2.5 14B',           quant: 'Q4_K_M', type: 'llm', vram: 9,  tier: 'Standard',     costPerReq: 0.00075, ctx: '128k', provider: 'Alibaba' },
+  mistral_22b: { name: 'Mistral Small 22B',      quant: 'Q4_K_M', type: 'llm', vram: 13, tier: 'Standard',     costPerReq: 0.00110, ctx: '32k',  provider: 'Mistral AI' },
+  llama_70b:   { name: 'Llama 3.3 70B Instruct', quant: 'Q4_K_M', type: 'llm', vram: 40, tier: 'Professional', costPerReq: 0.00320, ctx: '128k', provider: 'Meta' },
+  // STT — not quantized (encoder models, already small)
+  whisper_s:   { name: 'Whisper Small',           quant: 'FP16', type: 'stt', vram: 1,  tier: 'Starter',  costPerReq: 0.00020, provider: 'OpenAI (OSS)' },
+  distil_w:    { name: 'Distil-Whisper Large v3', quant: 'FP16', type: 'stt', vram: 3,  tier: 'Standard', costPerReq: 0.00035, provider: 'HuggingFace' },
+  whisper_l:   { name: 'Whisper Large v3',        quant: 'FP16', type: 'stt', vram: 5,  tier: 'Standard', costPerReq: 0.00045, provider: 'OpenAI (OSS)' },
+  // TTS
+  kokoro:      { name: 'Kokoro 82M', quant: 'FP16', type: 'tts', vram: 1, tier: 'Starter',  costPerReq: 0.00012, provider: 'Kokoro TTS' },
+  xtts:        { name: 'XTTS v2',    quant: 'FP16', type: 'tts', vram: 3, tier: 'Standard', costPerReq: 0.00025, provider: 'Coqui' },
+}
+
+// GPU options — RunPod base price + 65% Neuramine markup
+const ALL_GPUS = {
+  a4000: { name: 'NVIDIA RTX A4000', vram: 16, hourly: 0.48, provider: 'RunPod', tier: 'Starter'      },
+  a5000: { name: 'NVIDIA RTX A5000', vram: 24, hourly: 0.74, provider: 'RunPod', tier: 'Standard'     },
+  a40:   { name: 'NVIDIA A40',       vram: 48, hourly: 1.30, provider: 'RunPod', tier: 'Professional' },
+  a100:  { name: 'NVIDIA A100 80GB', vram: 80, hourly: 3.65, provider: 'RunPod', tier: 'Enterprise'   },
+}
+
+// Estimated daily request volume midpoints
+const REQ_MIDPOINTS = { '<20': 12, '50-200': 120, '200-1k': 580, '1k-5k': 2800, '5k+': 7500 }
+// User count scores (0–2)
+const USER_SCORE   = { '1': 0, '2-10': 0, '11-50': 1, '51-200': 2, '200+': 3 }
+// Req/day scores
+const REQ_SCORE    = { '<20': 0, '50-200': 0, '200-1k': 1, '1k-5k': 2, '5k+': 3 }
+// Reasoning scores
+const REASON_SCORE = { simple: 0, moderate: 1, deep: 2 }
+
+function computeRecommendation({ useCases, reasoning, userCount, reqPerDay, industry }) {
+  const needsLLM = useCases.some(u => ['doc_qa','chat','data','code','reasoning'].includes(u))
+  const needsSTT = useCases.includes('stt')
+  const needsTTS = useCases.includes('tts')
+  const needsCode = useCases.includes('code')
+  const regulated = ['healthcare','legal','finance'].includes(industry)
+
+  // ── LLM selection ──────────────────────────────────────────────────────────
+  let llm = null
+  let llmWhy = ''
+  if (needsLLM) {
+    const score =
+      REASON_SCORE[reasoning] * 2 +
+      USER_SCORE[userCount] +
+      REQ_SCORE[reqPerDay] +
+      (regulated ? 1 : 0)
+
+    if (score <= 1 && !needsCode) {
+      llm = ALL_MODELS.llama_3b
+      llmWhy = 'Low complexity + small scale — 3B is fast and cost-efficient.'
+    } else if (score <= 3 && !needsCode) {
+      llm = ALL_MODELS.llama_8b
+      llmWhy = 'Good balance of capability and cost for your scale.'
+    } else if (score <= 4 || needsCode) {
+      llm = ALL_MODELS.qwen_14b
+      llmWhy = needsCode
+        ? 'Qwen 2.5 14B has strong code generation and long context.'
+        : 'Moderate complexity + growing usage — 14B gives better output quality.'
+    } else if (score <= 6) {
+      llm = ALL_MODELS.mistral_22b
+      llmWhy = regulated
+        ? `${industry.charAt(0).toUpperCase() + industry.slice(1)} use cases benefit from Mistral 22B's accuracy.`
+        : 'Higher complexity and scale call for a 22B-class model.'
+    } else {
+      llm = ALL_MODELS.llama_70b
+      llmWhy = 'High concurrency + deep reasoning requires a 70B model for reliable output quality.'
+    }
+  }
+
+  // ── STT selection ──────────────────────────────────────────────────────────
+  let stt = null
+  let sttWhy = ''
+  if (needsSTT) {
+    if (reasoning === 'deep' || USER_SCORE[userCount] >= 2) {
+      stt = ALL_MODELS.whisper_l
+      sttWhy = 'Whisper Large v3 for highest accuracy at scale.'
+    } else if (reasoning === 'moderate') {
+      stt = ALL_MODELS.distil_w
+      sttWhy = 'Distil-Whisper — near-Large accuracy at half the VRAM.'
+    } else {
+      stt = ALL_MODELS.whisper_s
+      sttWhy = 'Whisper Small is sufficient for low-volume transcription.'
+    }
+  }
+
+  // ── TTS selection ──────────────────────────────────────────────────────────
+  let tts = null
+  let ttsWhy = ''
+  if (needsTTS) {
+    if (reasoning !== 'simple') {
+      tts = ALL_MODELS.xtts
+      ttsWhy = 'XTTS v2 for higher voice quality and multilingual support.'
+    } else {
+      tts = ALL_MODELS.kokoro
+      ttsWhy = 'Kokoro 82M is lightweight and fast for basic voice synthesis.'
+    }
+  }
+
+  // ── GPU selection ──────────────────────────────────────────────────────────
+  const usedVram = (llm?.vram || 0) + (stt?.vram || 0) + (tts?.vram || 0)
+  // 20% headroom for KV-cache growth, OS overhead, batching buffers
+  const requiredVram = Math.ceil(usedVram * 1.20)
+  // High concurrency → step up one tier to handle parallel requests
+  const needsExtra = USER_SCORE[userCount] >= 2 || REQ_SCORE[reqPerDay] >= 2
+
+  // With Q4_K_M: 22B = 13 GB → fits A4000 (16 GB); 70B = 40 GB → fits A40 (48 GB)
+  let gpu
+  if      (requiredVram <= 13 && !needsExtra) gpu = ALL_GPUS.a4000  // up to ~11 GB models (22B Q4 just fits)
+  else if (requiredVram <= 16 && !needsExtra) gpu = ALL_GPUS.a4000
+  else if (requiredVram <= 16 &&  needsExtra) gpu = ALL_GPUS.a5000
+  else if (requiredVram <= 24 && !needsExtra) gpu = ALL_GPUS.a5000
+  else if (requiredVram <= 24 &&  needsExtra) gpu = ALL_GPUS.a40
+  else if (requiredVram <= 48)                gpu = ALL_GPUS.a40    // 70B Q4_K_M (40 GB) fits here
+  else                                        gpu = ALL_GPUS.a100
+
+  // ── Cost estimates ─────────────────────────────────────────────────────────
+  const totalCostPerReq = (llm?.costPerReq || 0) + (stt?.costPerReq || 0) + (tts?.costPerReq || 0)
+  const dailyReqs = REQ_MIDPOINTS[reqPerDay] || 50
+  const serverlessMonthly = totalCostPerReq * dailyReqs * 30
+  const dedicatedMonthly  = gpu.hourly * 720
+  // Break-even: requests/month at which dedicated becomes cheaper
+  const breakEvenMonthly = totalCostPerReq > 0 ? Math.round(dedicatedMonthly / totalCostPerReq) : null
+
+  const models = [llm, stt, tts].filter(Boolean)
+
+  return {
+    models,
+    llmWhy, sttWhy, ttsWhy,
+    gpu,
+    usedVram,
+    requiredVram,
+    totalCostPerReq,
+    serverlessMonthly,
+    dedicatedMonthly,
+    breakEvenMonthly,
+    regulated,
+  }
+}
+
+// ─── Question + Result form ───────────────────────────────────────────────────
+
+const Q1_OPTIONS = [
+  { id: 'doc_qa',    label: 'Document Q&A' },
+  { id: 'chat',      label: 'Chat / conversation' },
+  { id: 'data',      label: 'Data analysis' },
+  { id: 'code',      label: 'Code generation' },
+  { id: 'reasoning', label: 'Complex reasoning' },
+  { id: 'stt',       label: 'Transcription (STT)' },
+  { id: 'tts',       label: 'Voice synthesis (TTS)' },
+]
+const Q2_OPTIONS = [
+  { id: 'simple',   label: 'Simple',   sub: 'Retrieval and summaries' },
+  { id: 'moderate', label: 'Moderate', sub: 'Analysis and drafting' },
+  { id: 'deep',     label: 'Deep',     sub: 'Multi-step, legal, medical' },
+]
+const Q3_OPTIONS = [
+  { id: '1',      label: '1 user' },
+  { id: '2-10',   label: '2–10 users' },
+  { id: '11-50',  label: '11–50 users' },
+  { id: '51-200', label: '51–200 users' },
+  { id: '200+',   label: '200+ users' },
+]
+const Q4_OPTIONS = [
+  { id: '<20',    label: 'Less than 20' },
+  { id: '50-200', label: '50–200' },
+  { id: '200-1k', label: '200–1,000' },
+  { id: '1k-5k',  label: '1,000–5,000' },
+  { id: '5k+',    label: '5,000+' },
+]
+const Q5_OPTIONS = [
+  { id: 'healthcare', label: 'Healthcare' },
+  { id: 'finance',    label: 'Finance' },
+  { id: 'legal',      label: 'Legal' },
+  { id: 'general',    label: 'General' },
+  { id: 'other',      label: 'Other' },
+]
+
+const TIER_COLORS = {
+  Starter:      'text-green-400  bg-green-400/10',
+  Standard:     'text-blue-400   bg-blue-400/10',
+  Professional: 'text-purple-400 bg-purple-400/10',
+  Enterprise:   'text-orange-400 bg-orange-400/10',
+}
+const TYPE_LABELS = { llm: 'LLM', stt: 'STT', tts: 'TTS' }
+
+function fmt(n) {
+  if (n >= 1000) return `$${(n / 1000).toFixed(1)}k`
+  if (n >= 10)   return `$${Math.round(n)}`
+  if (n >= 1)    return `$${n.toFixed(2)}`
+  if (n >= 0.01) return `$${n.toFixed(3)}`
+  return `$${n.toFixed(4)}`
+}
+
+// ─── Quick join (email only, no questions required) ───────────────────────────
+function QuickJoin({ source = 'quick' }) {
+  const [email, setEmail]   = useState('')
+  const [status, setStatus] = useState('idle')
+  const [err, setErr]       = useState('')
 
   const submit = async (e) => {
     e.preventDefault()
-    if (!email) return
     setStatus('loading')
     try {
       const res = await fetch('/api/waitlist', {
@@ -24,58 +224,389 @@ function WaitlistForm({ size = 'lg', source = 'hero' }) {
         body: JSON.stringify({ email, source }),
       })
       const data = await res.json()
-      if (res.ok) {
-        setStatus('success')
-        setMessage(data.message || "You're on the list! We'll email you with early access.")
-        setEmail('')
-      } else {
-        setStatus('error')
-        setMessage(data.error || 'Something went wrong. Try again.')
-      }
+      if (res.ok) { setStatus('success') }
+      else { setStatus('error'); setErr(data.error || 'Something went wrong.') }
     } catch {
-      setStatus('error')
-      setMessage('Network error. Please try again.')
+      setStatus('error'); setErr('Network error.')
     }
   }
 
-  if (status === 'success') {
+  if (status === 'success') return (
+    <div className="flex items-center gap-2 text-green-400 text-xs">
+      <Check size={13} className="shrink-0" />
+      <span>You're on the list — we'll email you at launch.</span>
+    </div>
+  )
+
+  return (
+    <form onSubmit={submit} className="flex gap-2">
+      <input
+        type="email" value={email} onChange={e => setEmail(e.target.value)}
+        placeholder="your@email.com" required
+        className="flex-1 h-11 bg-white/5 border border-white/15 rounded-xl px-4 text-white text-sm placeholder-white/30 focus:outline-none focus:border-brand transition-all"
+      />
+      <button type="submit" disabled={status === 'loading'}
+        className="shrink-0 h-11 px-5 bg-brand hover:bg-brand-dark text-white text-sm font-semibold rounded-xl transition-all disabled:opacity-50">
+        {status === 'loading' ? '...' : 'Join waitlist'}
+      </button>
+      {status === 'error' && <p className="text-red-400 text-xs mt-1">{err}</p>}
+    </form>
+  )
+}
+
+function WaitlistForm({ size = 'lg', source = 'hero' }) {
+  const [step, setStep]           = useState(1) // 1-5 = questions, 'result' = recommendation
+  const [useCases, setUseCases]   = useState([])
+  const [reasoning, setReasoning] = useState('')
+  const [userCount, setUserCount] = useState('')
+  const [reqPerDay, setReqPerDay] = useState('')
+  const [industry, setIndustry]   = useState('')
+  const [email, setEmail]         = useState('')
+  const [submitStatus, setSubmitStatus] = useState('idle')
+  const [errMsg, setErrMsg]       = useState('')
+
+  const toggleUseCase = id =>
+    setUseCases(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id])
+
+  const goToResult = (ind) => {
+    setIndustry(ind)
+    setStep('result')
+  }
+
+  const submit = async (e) => {
+    e.preventDefault()
+    setSubmitStatus('loading')
+    try {
+      const res = await fetch('/api/waitlist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email, source,
+          use_cases:   useCases.join(','),
+          reasoning,
+          user_count:  userCount,
+          req_per_day: reqPerDay,
+          industry,
+        }),
+      })
+      const data = await res.json()
+      if (res.ok) { setSubmitStatus('success') }
+      else { setSubmitStatus('error'); setErrMsg(data.error || 'Something went wrong.') }
+    } catch {
+      setSubmitStatus('error'); setErrMsg('Network error. Please try again.')
+    }
+  }
+
+  // ── Progress bar (questions only) ──────────────────────────────────────────
+  const QProgress = ({ current }) => (
+    <div className="flex items-center gap-1.5 mb-4">
+      {[1,2,3,4,5].map(n => (
+        <div key={n} className={`h-1 flex-1 rounded-full transition-all ${n <= current ? 'bg-brand' : 'bg-white/10'}`} />
+      ))}
+      <span className="text-xs text-white/30 ml-1 shrink-0">{current}/5</span>
+    </div>
+  )
+
+  const Back = ({ to }) => (
+    <button type="button" onClick={() => setStep(to)}
+      className="text-xs text-white/25 hover:text-white/50 transition-colors mt-3 block">← Back</button>
+  )
+
+  // ── Shared quick-join footer shown on every question step ─────────────────
+  const QuickJoinFooter = () => (
+    <div className="mt-6 pt-5 border-t border-white/10">
+      <div className="flex items-center gap-2 mb-3">
+        <div className="flex-1 h-px bg-white/8" />
+        <span className="text-xs text-white/35 font-medium px-2">or</span>
+        <div className="flex-1 h-px bg-white/8" />
+      </div>
+      <p className="text-base font-semibold text-white mb-1">Just join the waitlist</p>
+      <p className="text-xs text-white/45 mb-3">Skip the quiz — get early access + $20 credits at launch.</p>
+      <QuickJoin source={`${source}_skip`} />
+    </div>
+  )
+
+  // ── Q1: Use cases (multi-select) ───────────────────────────────────────────
+  if (step === 1) return (
+    <div className="w-full">
+      <QProgress current={1} />
+      <p className="text-xs font-semibold text-white/40 uppercase tracking-wider mb-1">Question 1 of 5</p>
+      <p className="text-sm font-semibold text-white mb-1">What will this AI do?</p>
+      <p className="text-xs text-white/35 mb-3">Select all that apply — we'll recommend the right model</p>
+      <div className="grid grid-cols-2 gap-2 mb-4">
+        {Q1_OPTIONS.map(o => {
+          const on = useCases.includes(o.id)
+          return (
+            <button key={o.id} type="button" onClick={() => toggleUseCase(o.id)}
+              className={`flex items-center gap-2 px-3 py-2.5 rounded-xl border text-left text-sm transition-all ${
+                on ? 'border-brand bg-brand/10 text-white' : 'border-white/10 bg-white/[0.03] text-white/60 hover:border-white/20 hover:text-white/80'
+              }`}>
+              <div className={`w-4 h-4 rounded shrink-0 border flex items-center justify-center transition-all ${on ? 'bg-brand border-brand' : 'border-white/20'}`}>
+                {on && <Check size={10} className="text-white" />}
+              </div>
+              {o.label}
+            </button>
+          )
+        })}
+      </div>
+      <button type="button" onClick={() => setStep(2)} disabled={useCases.length === 0}
+        className="w-full h-10 bg-brand hover:bg-brand-dark text-white text-sm font-semibold rounded-xl transition-all disabled:opacity-30">
+        Continue →
+      </button>
+      <QuickJoinFooter />
+    </div>
+  )
+
+  // ── Q2: Reasoning depth ────────────────────────────────────────────────────
+  if (step === 2) return (
+    <div className="w-full">
+      <QProgress current={2} />
+      <p className="text-xs font-semibold text-white/40 uppercase tracking-wider mb-1">Question 2 of 5</p>
+      <p className="text-sm font-semibold text-white mb-3">How deep does the reasoning need to be?</p>
+      <div className="space-y-2 mb-2">
+        {Q2_OPTIONS.map(o => (
+          <button key={o.id} type="button" onClick={() => { setReasoning(o.id); setStep(3) }}
+            className="w-full flex items-center justify-between px-4 py-3 rounded-xl border border-white/10 bg-white/[0.03] hover:border-brand hover:bg-brand/5 text-left transition-all group">
+            <span className="text-sm font-medium text-white/80 group-hover:text-white">{o.label}</span>
+            <span className="text-xs text-white/35">{o.sub}</span>
+          </button>
+        ))}
+      </div>
+      <Back to={1} />
+      <QuickJoinFooter />
+    </div>
+  )
+
+  // ── Q3: User count ─────────────────────────────────────────────────────────
+  if (step === 3) return (
+    <div className="w-full">
+      <QProgress current={3} />
+      <p className="text-xs font-semibold text-white/40 uppercase tracking-wider mb-1">Question 3 of 5</p>
+      <p className="text-sm font-semibold text-white mb-3">How many users will use this workspace?</p>
+      <div className="space-y-2 mb-2">
+        {Q3_OPTIONS.map(o => (
+          <button key={o.id} type="button" onClick={() => { setUserCount(o.id); setStep(4) }}
+            className="w-full px-4 py-3 rounded-xl border border-white/10 bg-white/[0.03] hover:border-brand hover:bg-brand/5 text-left text-sm font-medium text-white/80 hover:text-white transition-all">
+            {o.label}
+          </button>
+        ))}
+      </div>
+      <Back to={2} />
+      <QuickJoinFooter />
+    </div>
+  )
+
+  // ── Q4: Requests/day ───────────────────────────────────────────────────────
+  if (step === 4) return (
+    <div className="w-full">
+      <QProgress current={4} />
+      <p className="text-xs font-semibold text-white/40 uppercase tracking-wider mb-1">Question 4 of 5</p>
+      <p className="text-sm font-semibold text-white mb-3">How many requests per day?</p>
+      <div className="space-y-2 mb-2">
+        {Q4_OPTIONS.map(o => (
+          <button key={o.id} type="button" onClick={() => { setReqPerDay(o.id); setStep(5) }}
+            className="w-full px-4 py-3 rounded-xl border border-white/10 bg-white/[0.03] hover:border-brand hover:bg-brand/5 text-left text-sm font-medium text-white/80 hover:text-white transition-all">
+            {o.label}
+          </button>
+        ))}
+      </div>
+      <Back to={3} />
+      <QuickJoinFooter />
+    </div>
+  )
+
+  // ── Q5: Industry ───────────────────────────────────────────────────────────
+  if (step === 5) return (
+    <div className="w-full">
+      <QProgress current={5} />
+      <p className="text-xs font-semibold text-white/40 uppercase tracking-wider mb-1">Question 5 of 5</p>
+      <p className="text-sm font-semibold text-white mb-3">What industry is this for?</p>
+      <div className="space-y-2 mb-2">
+        {Q5_OPTIONS.map(o => (
+          <button key={o.id} type="button" onClick={() => goToResult(o.id)}
+            className="w-full px-4 py-3 rounded-xl border border-white/10 bg-white/[0.03] hover:border-brand hover:bg-brand/5 text-left text-sm font-medium text-white/80 hover:text-white transition-all">
+            {o.label}
+          </button>
+        ))}
+      </div>
+      <Back to={4} />
+      <QuickJoinFooter />
+    </div>
+  )
+
+  // ── Result: recommendation + email ─────────────────────────────────────────
+  if (step === 'result') {
+    const rec = computeRecommendation({ useCases, reasoning, userCount, reqPerDay, industry })
+    const whyMap = { llm: rec.llmWhy, stt: rec.sttWhy, tts: rec.ttsWhy }
+    const vramPct = Math.min(100, Math.round((rec.usedVram / rec.gpu.vram) * 100))
+
+    if (submitStatus === 'success') return (
+      <div className="flex items-start gap-3 text-green-400 bg-green-400/10 border border-green-400/20 rounded-xl px-5 py-5">
+        <Check size={20} className="shrink-0 mt-0.5" />
+        <div>
+          <p className="text-sm font-semibold mb-1">You're on the list!</p>
+          <p className="text-sm text-green-400/80 leading-relaxed">
+            We'll email you early access + $20 in credits at launch.
+            {rec.regulated && ` Your ${industry} workspace will have compliance mode enabled on day one.`}
+          </p>
+        </div>
+      </div>
+    )
+
     return (
-      <div className="flex items-center gap-3 text-green-400 bg-green-400/10 border border-green-400/20 rounded-xl px-5 py-4">
-        <Check size={20} className="shrink-0" />
-        <p className="text-sm font-medium">{message}</p>
+      <div className="w-full">
+        {/* Header */}
+        <div className="flex items-center gap-2 mb-4">
+          <Sparkles size={14} className="text-brand" />
+          <p className="text-sm font-semibold text-white">Your recommended configuration</p>
+          <button type="button" onClick={() => setStep(1)}
+            className="ml-auto text-xs text-white/25 hover:text-white/50 transition-colors">
+            ← Redo
+          </button>
+        </div>
+
+        {/* Models */}
+        <div className="space-y-2 mb-4">
+          {rec.models.map(m => (
+            <div key={m.name} className="bg-white/[0.04] border border-white/8 rounded-xl px-4 py-3">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-sm font-semibold text-white">{m.name}</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs text-white/40 bg-white/5 px-2 py-0.5 rounded-full">{TYPE_LABELS[m.type]}</span>
+                  <span className="text-xs text-white/35 bg-white/5 px-2 py-0.5 rounded-full font-mono">{m.quant}</span>
+                  <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${TIER_COLORS[m.tier]}`}>{m.tier}</span>
+                </div>
+              </div>
+              <div className="flex items-center gap-3 text-xs text-white/35 mb-1.5">
+                <span>{m.provider}</span>
+                <span>·</span>
+                <span>{m.vram} GB VRAM</span>
+                {m.ctx && <><span>·</span><span>{m.ctx} ctx</span></>}
+                <span>·</span>
+                <span className="text-white/50">{fmt(m.costPerReq)}/req</span>
+              </div>
+              <p className="text-xs text-white/45 leading-relaxed">{whyMap[m.type]}</p>
+            </div>
+          ))}
+        </div>
+
+        {/* GPU */}
+        <div className="bg-white/[0.04] border border-white/8 rounded-xl px-4 py-3 mb-4">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              <Cpu size={13} className="text-white/50" />
+              <span className="text-sm font-semibold text-white">{rec.gpu.name}</span>
+            </div>
+            <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${TIER_COLORS[rec.gpu.tier]}`}>{rec.gpu.tier}</span>
+          </div>
+          <div className="flex items-center justify-between text-xs text-white/40 mb-2">
+            <span>{rec.gpu.vram} GB VRAM · {rec.gpu.provider}</span>
+            <span>{rec.usedVram} GB used of {rec.gpu.vram} GB ({vramPct}%)</span>
+          </div>
+          {/* VRAM bar */}
+          <div className="h-1.5 bg-white/10 rounded-full overflow-hidden">
+            <div className="h-full bg-brand rounded-full transition-all" style={{ width: `${vramPct}%` }} />
+          </div>
+        </div>
+
+        {/* Cost comparison */}
+        <div className="grid grid-cols-2 gap-2 mb-4">
+          {/* Serverless */}
+          <div className="bg-white/[0.04] border border-white/8 rounded-xl p-3">
+            <p className="text-xs font-semibold text-white/50 mb-2 flex items-center gap-1.5">
+              <Zap size={11} className="text-yellow-400" /> Serverless
+            </p>
+            <p className="text-lg font-bold text-white">{fmt(rec.totalCostPerReq)}</p>
+            <p className="text-xs text-white/35 mb-2">per request</p>
+            <div className="border-t border-white/5 pt-2 space-y-1">
+              <div className="flex justify-between text-xs">
+                <span className="text-white/40">Est. / month</span>
+                <span className="text-white/70 font-medium">{fmt(rec.serverlessMonthly)}</span>
+              </div>
+              <div className="flex justify-between text-xs">
+                <span className="text-white/40">Idle cost</span>
+                <span className="text-green-400 font-medium">$0</span>
+              </div>
+            </div>
+            <p className="text-xs text-white/25 mt-2 leading-tight">Scales to zero. Cold start ~5s.</p>
+          </div>
+
+          {/* Dedicated */}
+          <div className="bg-white/[0.04] border border-white/8 rounded-xl p-3">
+            <p className="text-xs font-semibold text-white/50 mb-2 flex items-center gap-1.5">
+              <Server size={11} className="text-blue-400" /> Dedicated 24/7
+            </p>
+            <p className="text-lg font-bold text-white">{fmt(rec.gpu.hourly)}</p>
+            <p className="text-xs text-white/35 mb-2">per hour</p>
+            <div className="border-t border-white/5 pt-2 space-y-1">
+              <div className="flex justify-between text-xs">
+                <span className="text-white/40">Per month</span>
+                <span className="text-white/70 font-medium">{fmt(rec.dedicatedMonthly)}</span>
+              </div>
+              <div className="flex justify-between text-xs">
+                <span className="text-white/40">Cold starts</span>
+                <span className="text-white font-medium">None</span>
+              </div>
+            </div>
+            <p className="text-xs text-white/25 mt-2 leading-tight">Always warm. Best for production.</p>
+          </div>
+        </div>
+
+        {/* Break-even note */}
+        {rec.breakEvenMonthly && (
+          <p className="text-xs text-white/30 text-center mb-3">
+            Dedicated becomes cheaper above{' '}
+            <span className="text-white/55">{rec.breakEvenMonthly.toLocaleString()} requests/month</span>
+            {' '}(~{Math.round(rec.breakEvenMonthly / 30).toLocaleString()}/day).
+          </p>
+        )}
+
+        {/* BYOG callout */}
+        <div className="bg-brand/5 border border-brand/15 rounded-xl px-4 py-3 mb-4 flex items-start gap-3">
+          <Lock size={14} className="text-brand shrink-0 mt-0.5" />
+          <div>
+            <p className="text-xs font-semibold text-white/70">Have your own GPU? It's free forever.</p>
+            <p className="text-xs text-white/35 mt-0.5">Run Neuramine on your own server — $0 GPU cost, data never leaves your building. Platform fee waived.</p>
+          </div>
+        </div>
+
+        {/* Compliance note */}
+        {rec.regulated && (
+          <div className="bg-green-400/5 border border-green-400/15 rounded-xl px-4 py-3 mb-4">
+            <p className="text-xs text-green-400/80">
+              <span className="font-semibold capitalize">{industry}</span> compliance mode will be enabled —
+              HIPAA audit logs, AES-256 encryption per workspace, BAA available.
+            </p>
+          </div>
+        )}
+
+        {/* Email capture */}
+        <div className="border-t border-white/8 pt-4">
+          <p className="text-xs text-white/50 mb-3">
+            Save this configuration — get notified when we launch + <span className="text-brand font-medium">$20 in free credits</span>.
+          </p>
+          <form onSubmit={submit}>
+            <div className="flex gap-2">
+              <input type="email" value={email} onChange={e => setEmail(e.target.value)}
+                placeholder="you@company.com" required
+                className="flex-1 h-11 bg-white/5 border border-white/10 rounded-xl px-4 text-white text-sm placeholder-white/30 focus:outline-none focus:border-brand transition-all" />
+              <button type="submit" disabled={submitStatus === 'loading'}
+                className="shrink-0 h-11 px-5 bg-brand hover:bg-brand-dark text-white text-sm font-semibold rounded-xl transition-all disabled:opacity-50">
+                {submitStatus === 'loading' ? '...' : 'Reserve →'}
+              </button>
+            </div>
+            {submitStatus === 'error' && (
+              <p className="text-red-400 text-xs flex items-center gap-1.5 mt-1.5">
+                <AlertCircle size={11} /> {errMsg}
+              </p>
+            )}
+          </form>
+        </div>
       </div>
     )
   }
 
-  return (
-    <form onSubmit={submit} className="w-full">
-      <div className={`flex gap-2 ${size === 'sm' ? 'flex-col sm:flex-row' : 'flex-col sm:flex-row'}`}>
-        <input
-          type="email"
-          value={email}
-          onChange={e => setEmail(e.target.value)}
-          placeholder="you@company.com"
-          required
-          className={`flex-1 bg-white/5 border border-white/10 rounded-xl px-4 text-white placeholder-white/30 focus:outline-none focus:border-brand focus:bg-white/8 transition-all ${size === 'lg' ? 'h-14 text-base' : 'h-11 text-sm'}`}
-        />
-        <button
-          type="submit"
-          disabled={status === 'loading'}
-          className={`shrink-0 bg-brand hover:bg-brand-dark text-white font-semibold rounded-xl transition-all disabled:opacity-50 ${size === 'lg' ? 'h-14 px-7 text-base' : 'h-11 px-5 text-sm'}`}
-        >
-          {status === 'loading' ? 'Joining...' : 'Join waitlist →'}
-        </button>
-      </div>
-      {status === 'error' && (
-        <p className="mt-2 text-red-400 text-sm flex items-center gap-1.5">
-          <AlertCircle size={14} /> {message}
-        </p>
-      )}
-      <p className="mt-2.5 text-white/35 text-xs">
-        Get <span className="text-brand font-medium">$20 in free credits</span> at launch — double the standard trial. No spam. Unsubscribe anytime.
-      </p>
-    </form>
-  )
+  return null
 }
 
 // ─── Nav ──────────────────────────────────────────────────────────────────────
@@ -128,7 +659,7 @@ function Hero() {
           Zero ML expertise required. HIPAA-compliant on day one.
         </p>
 
-        <div className="max-w-lg mx-auto mb-10 animate-fade-in-up delay-300">
+        <div className="max-w-xl mx-auto mb-10 animate-fade-in-up delay-300">
           <WaitlistForm size="lg" source="hero" />
         </div>
 
@@ -503,9 +1034,9 @@ function Models() {
     <section className="py-24 border-t border-white/5">
       <div className="max-w-6xl mx-auto px-5">
         <div className="text-center mb-16">
-          <h2 className="text-3xl sm:text-4xl font-bold mb-4">Curated model catalogue</h2>
+          <h2 className="text-3xl sm:text-4xl font-bold mb-4">Open-source models, unified API</h2>
           <p className="text-white/50 text-lg max-w-2xl mx-auto">
-            All models cached in Neuramine's own registry — independent of HuggingFace availability. LLM, STT, and TTS unified under one API.
+            The models below are popular starting points — Neuramine supports the full open-source ecosystem. If it runs on a GPU and ships as open weights, you can deploy it.
           </p>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -528,6 +1059,10 @@ function Models() {
                     <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${tierColors[tier]}`}>{tier}</span>
                   </div>
                 ))}
+                <div className="px-6 py-3 flex items-center gap-2 text-xs text-white/30">
+                  <Sparkles size={11} className="text-brand shrink-0" />
+                  <span>+ many more open-source models available on request</span>
+                </div>
               </div>
             </div>
           ))}
@@ -749,6 +1284,14 @@ function FAQ() {
       a: "Yes — that's what workspaces are for. You invite teammates by email. They get a magic link, click it, and land directly in the chat interface with no access to billing or settings. All conversations in a workspace are shared among the team. You control who has access.",
     },
     {
+      q: "Do you only support the models listed on the page?",
+      a: "No — the listed models are a curated starting point to show the range of what's available. Neuramine supports the full open-source model ecosystem. Any open-weight LLM (Llama, Mistral, Qwen, Falcon, Phi, DeepSeek, Gemma, and more), STT model (Whisper variants, Wav2Vec2, MMS, SeamlessM4T), or TTS model (XTTS, Kokoro, StyleTTS2, Bark, Tortoise, and more) that runs on a GPU can be deployed through Neuramine. If you need a specific model not shown, reach out — we'll add it.",
+    },
+    {
+      q: "Can I bring my own fine-tuned or custom model?",
+      a: "Yes. You can load any HuggingFace-compatible checkpoint or GGUF file into a BYOG workspace. Upload the weights to your GPU machine, point the Neuramine Agent at the path, and it appears as a selectable model in your workspace — same API, same compliance layer, same chat interface.",
+    },
+    {
       q: "When is the public launch?",
       a: "We're currently in private beta, building toward a public launch in the next few months. Joining the waitlist gets you $20 in credits at launch (double the standard trial) and early access before public availability.",
     },
@@ -823,8 +1366,8 @@ function Footer() {
           <span className="text-white/40 text-sm">Neuramine Systems Inc., Moncton, NB, Canada</span>
         </div>
         <div className="flex items-center gap-5 text-white/30 text-sm">
-          <a href="#" className="hover:text-white/60 transition-colors">Privacy</a>
-          <a href="#" className="hover:text-white/60 transition-colors">Terms</a>
+          <a href="/privacy" className="hover:text-white/60 transition-colors">Privacy</a>
+          <a href="/terms" className="hover:text-white/60 transition-colors">Terms</a>
           <a href="mailto:hello@neuramine.io" className="hover:text-white/60 transition-colors">Contact</a>
         </div>
       </div>
